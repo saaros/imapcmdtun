@@ -19,7 +19,8 @@ def main(args):
     for arg in args:
         k, _, v = arg.partition("=")
         if k == "config":
-            config.update(json.load(open(v, "rb")))
+            with open(v, "r") as f:
+                config.update(json.load(f))
         else:
             if k == "port":
                 v = int(v)
@@ -44,12 +45,21 @@ def listener(config):
             lsock.close()
             return client(config, log, sock)
         sock.close()
+        # reap children
+        while pid:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except OSError as ex:
+                if ex.errno == errno.ECHILD:
+                    break
+            if pid:
+                log.info("child %r exited with status %r", pid, status)
 
 
 def client(config, log, s):
     def output(m):
         log.info("%r>>>%r", s.fileno(), m)
-        s.send(m)
+        s.send(m if isinstance(m, bytes) else m.encode("utf-8"))
 
     tunnel_command = config.get("tunnel_command")
     if not tunnel_command:
@@ -72,11 +82,13 @@ def client(config, log, s):
             log.exception("socket.error")
             return
 
-        if data == "":
+        if not data:
             log.info("no data, DONE")
             break
+        if isinstance(data, bytes) and bytes is not str:
+            data = data.decode("utf-8")
         buf += data
-        log.info("%r<<<read %r bytes, buffer now %r bytes",
+        log.info("%r<<<read %r chars, buffer now %r chars",
                  s.fileno(), len(data), len(buf))
 
         while True:
@@ -90,7 +102,7 @@ def client(config, log, s):
                 if len(msg) < 2:
                     output("{0} BAD missing command\r\n".format(msg[0] if msg else "*"))
                     continue
-                tag = int(msg[0])
+                tag = msg[0]
                 cmd = msg[1].upper()
                 if cmd == "LOGIN" and len(msg) >= 4:
                     log_msg = list(msg)
