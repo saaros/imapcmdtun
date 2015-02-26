@@ -9,42 +9,59 @@ import errno
 import json
 import logging
 import os
+import select
 import socket
 import sys
 
 
 def main(args):
     logging.basicConfig(level=logging.DEBUG, format="%(asctime)s\t%(levelname)s\t%(name)s[%(process)s]\t%(message)s")
+    services = []
     config = {}
     for arg in args:
         k, _, v = arg.partition("=")
         if k == "config":
             with open(v, "r") as f:
-                config.update(json.load(f))
+                services.extend(json.load(f))
         else:
             if k == "port":
                 v = int(v)
             config[k] = v
-    listener(config)
+    if config:
+        services.append(config)
+    listener(services)
 
 
-def listener(config):
+def listener(services):
     log = logging.getLogger("imapcmdtun")
-    lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.SOL_TCP)
-    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    lsock.bind(("127.0.0.1", config["port"]))
-    lsock.listen(1)
-    log.info("listening on port %r", config["port"])
+
+    socks = {}
+    for config in services:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.SOL_TCP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", config["port"]))
+        sock.listen(1)
+        log.info("listening on port %r (%s)", config["port"], config["protocol"])
+        socks[sock] = config
 
     while True:
-        res = lsock.accept()
-        log.info("new connection from %r", res[1])
-        sock = res[0]
-        pid = os.fork()
-        if pid == 0:
-            lsock.close()
-            return client(config, log, sock)
-        sock.close()
+        rlist, _, _ = select.select(socks, [], [])
+        for lsock in rlist:
+            config = socks[lsock]
+            res = lsock.accept()
+            log.info("new %s connection from %r", config["protocol"], res[1])
+            sock = res[0]
+            pid = os.fork()
+            if pid == 0:
+                for lsock in socks:
+                    lsock.close()
+                if config["protocol"] == "imap":
+                    return imap_client(config, log, sock)
+                elif config["protocol"] == "smtp":
+                    return smtp_client(config, log, sock)
+                else:
+                    raise Exception("unknown protocol")
+            sock.close()
         # reap children
         while pid:
             try:
@@ -56,7 +73,25 @@ def listener(config):
                 log.info("child %r exited with status %r", pid, status)
 
 
-def client(config, log, s):
+def smtp_client(config, log, s):
+    tunnel_command = config.get("tunnel_command")
+    if not tunnel_command:
+        ssh_target = config["ssh_target"]
+        imap_command = config.get("smtp_command")
+        if not imap_command:
+            imap_command = "/usr/sbin/sendmail -bs"
+        tunnel_command = ["/usr/bin/ssh", ssh_target, imap_command]
+    log.info("Executing %r", tunnel_command)
+    os.close(0)
+    os.close(1)
+    os.close(2)
+    os.dup2(s.fileno(), 0)
+    os.dup2(s.fileno(), 1)
+    os.close(s.fileno())
+    os.execv(tunnel_command[0], tunnel_command)
+
+
+def imap_client(config, log, s):
     def output(m):
         log.info("%r>>>%r", s.fileno(), m)
         s.send(m if isinstance(m, bytes) else m.encode("utf-8"))
